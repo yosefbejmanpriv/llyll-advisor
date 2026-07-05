@@ -44,7 +44,51 @@ function LlyllLogo({ size = 36 }) {
   );
 }
 
-function CopyButton({ text }) {
+// Best-effort parse of a JSON string that may be cut off mid-stream:
+// close any open strings, objects, and arrays, then try JSON.parse.
+function parsePartialJson(text) {
+  let inString = false, escaped = false;
+  const stack = [];
+  for (const ch of text) {
+    if (escaped) { escaped = false; continue; }
+    if (inString) {
+      if (ch === "\\") escaped = true;
+      else if (ch === '"') inString = false;
+      continue;
+    }
+    if (ch === '"') inString = true;
+    else if (ch === "{" || ch === "[") stack.push(ch);
+    else if (ch === "}" || ch === "]") stack.pop();
+  }
+  let repaired = text;
+  if (escaped) repaired = repaired.slice(0, -1);
+  if (inString) repaired += '"';
+  repaired = repaired.replace(/[,:]\s*$/, m => (m.trim() === ":" ? ': ""' : ""));
+  for (let i = stack.length - 1; i >= 0; i--) {
+    repaired += stack[i] === "{" ? "}" : "]";
+  }
+  try {
+    return JSON.parse(repaired);
+  } catch {
+    return null;
+  }
+}
+
+function planToText(r) {
+  const parts = [];
+  if (r.video_type?.name) parts.push(`VIDEO TYPE: ${r.video_type.name}\n${r.video_type.reason || ""}`.trim());
+  if (r.script?.content) parts.push(`SCRIPT — ${r.script.title || ""}\n${r.script.content}`.trim());
+  if (r.contributors?.people?.length) {
+    const lines = r.contributors.people.map(p =>
+      `• ${p.count > 1 ? `${p.count}× ` : ""}${p.role}: "${p.prompt}"`
+    );
+    parts.push(`WHO TO INVITE\n${lines.join("\n")}`);
+  }
+  if (r.invite?.content) parts.push(`INVITE MESSAGE\n${r.invite.content}`);
+  return parts.join("\n\n");
+}
+
+function CopyButton({ text, label = "copy" }) {
   const [copied, setCopied] = useState(false);
   return (
     <button
@@ -69,7 +113,7 @@ function CopyButton({ text }) {
         flexShrink: 0,
       }}
     >
-      {copied ? "✓ copied" : "copy"}
+      {copied ? "✓ copied" : label}
     </button>
   );
 }
@@ -93,6 +137,20 @@ function OutputCard({ label, badge, badgeLime, children, copyText }) {
   );
 }
 
+function ContributorRow({ person }) {
+  return (
+    <div style={{ display: "flex", gap: "12px", alignItems: "baseline", padding: "10px 0", borderBottom: `1px solid ${C.border}` }}>
+      <span style={{ fontSize: "12px", fontWeight: 700, background: C.ink, color: C.bg, borderRadius: "3px", padding: "2px 8px", flexShrink: 0, whiteSpace: "nowrap" }}>
+        {person.count > 1 ? `${person.count}×` : "1×"}
+      </span>
+      <div>
+        <div style={{ fontSize: "13px", fontWeight: 700 }}>{person.role}</div>
+        <div style={{ fontSize: "13px", color: C.inkMid, fontStyle: "italic" }}>“{person.prompt}”</div>
+      </div>
+    </div>
+  );
+}
+
 const EXAMPLES = [
   "I run a monthly entrepreneur meetup in Panama City.",
   "I'm organizing a hackathon and need to explain the challenge to participants before they arrive.",
@@ -100,14 +158,22 @@ const EXAMPLES = [
   "I want new members to understand why they should join my alumni network.",
 ];
 
+const REFINEMENTS = [
+  { label: "Shorter", instruction: "make the script and invite noticeably shorter" },
+  { label: "More hype", instruction: "make it higher energy, more hype" },
+  { label: "More casual", instruction: "make it more casual and relaxed" },
+];
+
 export default function Home() {
   const [input, setInput] = useState("");
   const [loading, setLoading] = useState(false);
   const [result, setResult] = useState(null);
   const [error, setError] = useState(null);
+  const [lastSituation, setLastSituation] = useState(null);
 
-  const run = async () => {
-    if (!input.trim() || loading) return;
+  const run = async ({ refinement = null, previous = null, situation = null } = {}) => {
+    const sit = (situation ?? input).trim();
+    if (!sit || loading) return;
     setLoading(true);
     setResult(null);
     setError(null);
@@ -115,19 +181,50 @@ export default function Home() {
       const res = await fetch("/api/generate", {
         method: "POST",
         headers: { "Content-Type": "application/json" },
-        body: JSON.stringify({ situation: input.trim() }),
+        body: JSON.stringify({ situation: sit, refinement, previous }),
       });
-      const data = await res.json();
-      if (data.error) throw new Error(data.error);
-      setResult(data);
-    } catch {
-      setError("Something went wrong. Try again.");
+
+      const contentType = res.headers.get("content-type") || "";
+      if (!res.ok || contentType.includes("application/json")) {
+        const data = await res.json().catch(() => ({}));
+        throw new Error(data.error || "Something went wrong. Try again.");
+      }
+
+      // Stream the response, rendering fields as they arrive.
+      const reader = res.body.getReader();
+      const decoder = new TextDecoder();
+      let acc = "";
+      let lastGood = null;
+      while (true) {
+        const { done, value } = await reader.read();
+        if (done) break;
+        acc += decoder.decode(value, { stream: true });
+        const partial = parsePartialJson(acc);
+        if (partial) {
+          lastGood = partial;
+          setResult(partial);
+        }
+      }
+
+      const final = parsePartialJson(acc) || lastGood;
+      if (!final?.video_type?.name || !final?.script?.content || !final?.invite?.content) {
+        throw new Error("Got an incomplete response. Try again.");
+      }
+      setResult(final);
+      setLastSituation(sit);
+    } catch (e) {
+      setResult(null);
+      setError(e.message || "Something went wrong. Try again.");
     } finally {
       setLoading(false);
     }
   };
 
+  const refine = instruction => run({ refinement: instruction, previous: result, situation: lastSituation });
+  const regenerate = () => run({ situation: lastSituation });
+
   const canRun = input.trim().length > 0 && !loading;
+  const complete = result && !loading;
 
   return (
     <div style={{ minHeight: "100vh", background: C.bg, fontFamily: "'Inter', system-ui, -apple-system, sans-serif", color: C.ink }}>
@@ -142,7 +239,7 @@ export default function Home() {
             What video should you make?
           </h1>
           <p style={{ fontSize: "14px", color: C.inkMid, margin: 0, lineHeight: 1.6 }}>
-            Describe your situation in a sentence or two — get a video type, a ready-to-record script, and a contributor invite.
+            Describe your situation in a sentence or two — get a video type, a ready-to-record script, who to invite, and the invite message.
           </p>
         </div>
 
@@ -151,6 +248,7 @@ export default function Home() {
             value={input}
             onChange={e => setInput(e.target.value)}
             onKeyDown={e => { if (e.key === "Enter" && (e.metaKey || e.ctrlKey)) run(); }}
+            aria-label="Describe your situation"
             placeholder="e.g. I run a monthly entrepreneur meetup in Panama City and want people to show up to the next one."
             rows={4}
             style={{ width: "100%", boxSizing: "border-box", fontSize: "14px", lineHeight: "1.65", padding: "16px 18px 12px", border: "none", outline: "none", resize: "none", fontFamily: "inherit", color: C.ink, background: "transparent", display: "block" }}
@@ -158,7 +256,7 @@ export default function Home() {
           <div style={{ display: "flex", justifyContent: "space-between", alignItems: "center", padding: "10px 14px", borderTop: `1px solid ${C.border}` }}>
             <span style={{ fontSize: "11px", color: C.inkLight, letterSpacing: "0.02em" }}>⌘ + Enter to generate</span>
             <button
-              onClick={run}
+              onClick={() => run()}
               disabled={!canRun}
               style={{ background: canRun ? C.lime : C.border, color: canRun ? C.ink : C.inkLight, border: "none", borderRadius: "5px", padding: "9px 18px", fontSize: "13px", fontWeight: 700, letterSpacing: "0.02em", cursor: canRun ? "pointer" : "default", fontFamily: "inherit", transition: "background 0.15s, color 0.15s" }}
             >
@@ -167,7 +265,7 @@ export default function Home() {
           </div>
         </div>
 
-        {!result && (
+        {!result && !loading && (
           <div style={{ marginTop: "10px" }}>
             <span style={{ fontSize: "11px", color: C.inkLight, letterSpacing: "0.04em", marginRight: "8px" }}>Try:</span>
             {EXAMPLES.map(ex => (
@@ -183,8 +281,17 @@ export default function Home() {
         )}
 
         {error && (
-          <div style={{ marginBottom: "16px", padding: "12px 16px", background: "#fff0f0", border: "1px solid #f5c6c6", borderRadius: "6px", fontSize: "13px", color: "#a33" }}>
+          <div style={{ marginTop: "16px", padding: "12px 16px", background: "#fff0f0", border: "1px solid #f5c6c6", borderRadius: "6px", fontSize: "13px", color: "#a33" }}>
             {error}
+          </div>
+        )}
+
+        {loading && !result && (
+          <div style={{ marginTop: "28px" }}>
+            <style>{`@keyframes llyllPulse { 0%, 100% { opacity: 0.45; } 50% { opacity: 1; } }`}</style>
+            {[72, 120, 96].map((h, i) => (
+              <div key={i} style={{ background: C.card, border: `1px solid ${C.cardBorder}`, borderRadius: "8px", height: `${h}px`, marginBottom: "12px", animation: `llyllPulse 1.4s ease-in-out ${i * 0.2}s infinite` }} />
+            ))}
           </div>
         )}
 
@@ -195,15 +302,59 @@ export default function Home() {
               <span style={{ fontSize: "10px", fontWeight: 700, letterSpacing: "0.12em", textTransform: "uppercase", color: C.inkLight }}>your video plan</span>
               <div style={{ flex: 1, height: "1px", background: C.border }} />
             </div>
-            <OutputCard label="Video type" badge={result.video_type?.name} badgeLime>
-              {result.video_type?.reason}
-            </OutputCard>
-            <OutputCard label="Script / structure" badge={result.script?.title} copyText={result.script?.content}>
-              {result.script?.content}
-            </OutputCard>
-            <OutputCard label="Contributor invite" copyText={result.invite?.content}>
-              {result.invite?.content}
-            </OutputCard>
+
+            {result.video_type?.name && (
+              <OutputCard label="Video type" badge={result.video_type.name} badgeLime>
+                {result.video_type.reason}
+              </OutputCard>
+            )}
+
+            {result.script?.content && (
+              <OutputCard label="Script / structure" badge={result.script.title} copyText={complete ? result.script.content : null}>
+                {result.script.content}
+              </OutputCard>
+            )}
+
+            {result.contributors?.people?.length > 0 && (
+              <div style={{ background: C.card, border: `1px solid ${C.cardBorder}`, borderRadius: "8px", padding: "20px 22px", marginBottom: "12px" }}>
+                <div style={{ fontSize: "9px", fontWeight: 700, letterSpacing: "0.14em", textTransform: "uppercase", color: C.inkLight, marginBottom: "6px" }}>
+                  Who to invite
+                </div>
+                {result.contributors.people.map((p, i) => (
+                  <ContributorRow key={i} person={p} />
+                ))}
+              </div>
+            )}
+
+            {result.invite?.content && (
+              <OutputCard label="Contributor invite" copyText={complete ? result.invite.content : null}>
+                {result.invite.content}
+              </OutputCard>
+            )}
+
+            {complete && (
+              <div style={{ display: "flex", alignItems: "center", gap: "8px", flexWrap: "wrap", marginTop: "16px" }}>
+                <span style={{ fontSize: "11px", color: C.inkLight, letterSpacing: "0.04em" }}>Tweak:</span>
+                {REFINEMENTS.map(r => (
+                  <button
+                    key={r.label}
+                    onClick={() => refine(r.instruction)}
+                    style={{ background: "transparent", border: `1px solid ${C.cardBorder}`, borderRadius: "20px", padding: "5px 13px", fontSize: "12px", fontWeight: 600, color: C.inkMid, cursor: "pointer", fontFamily: "inherit", lineHeight: 1.5 }}
+                  >
+                    {r.label}
+                  </button>
+                ))}
+                <button
+                  onClick={regenerate}
+                  style={{ background: "transparent", border: `1px solid ${C.cardBorder}`, borderRadius: "20px", padding: "5px 13px", fontSize: "12px", fontWeight: 600, color: C.inkMid, cursor: "pointer", fontFamily: "inherit", lineHeight: 1.5 }}
+                >
+                  ↻ Regenerate
+                </button>
+                <div style={{ marginLeft: "auto" }}>
+                  <CopyButton text={planToText(result)} label="copy full plan" />
+                </div>
+              </div>
+            )}
           </div>
         )}
       </div>
